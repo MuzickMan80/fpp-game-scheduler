@@ -9,46 +9,44 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 
-# Default FPP schedule config endpoint.
-# Adjust this if your FPP instance is on another host or path.
 DEFAULT_FPP_API_URL = "http://192.168.8.2/api/configfile/schedule.json"
+DEFAULT_MAPPINGS_FILE = "/home/fpp/media/config/plugin.fpp-game-scheduler.json"
 ESPN_SITE_API_BASE = "https://site.api.espn.com"
+PLUGIN_MARKER_KEY = "_fppGameScheduler"
 
 
-TEAMS: Dict[str, Dict[str, object]] = {
-    "brewers": {
-        "sport": "baseball",
-        "league": "mlb",
-        "team_query": "Milwaukee Brewers",
-        "abbreviation": "MIL",
-        "name": "Brewers",
-        "game_length_hours": 3.0,
-    },
-    "packers": {
-        "sport": "football",
-        "league": "nfl",
-        "team_query": "Green Bay Packers",
-        "abbreviation": "GB",
-        "name": "Packers",
-        "game_length_hours": 3.5,
-    },
-}
+def default_mappings() -> List[dict]:
+    return [
+        {
+            "playlist": "brewers",
+            "sport": "baseball",
+            "league": "mlb",
+            "team_name": "Milwaukee Brewers",
+            "team_abbr": "MIL",
+            "pregame_minutes": 60,
+            "game_length_hours": 3.0,
+            "postgame_buffer_minutes": 30,
+        },
+        {
+            "playlist": "packers",
+            "sport": "football",
+            "league": "nfl",
+            "team_name": "Green Bay Packers",
+            "team_abbr": "GB",
+            "pregame_minutes": 60,
+            "game_length_hours": 3.5,
+            "postgame_buffer_minutes": 30,
+        },
+    ]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Pull team schedules and sync matching game windows into FPP."
     )
+    parser.add_argument("--dry-run", action="store_true", help="Preview only, no POST.")
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Compute and print changes but do not POST updates to FPP.",
-    )
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=1,
-        help="Number of days to scan starting today (default: 1).",
+        "--days", type=int, default=1, help="Number of days to scan from today."
     )
     parser.add_argument(
         "--fpp-url",
@@ -76,11 +74,15 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("FPP_TOKEN", ""),
         help="FPP bearer token (or set FPP_TOKEN).",
     )
+    parser.add_argument(
+        "--mappings-file",
+        default=DEFAULT_MAPPINGS_FILE,
+        help="JSON file containing team-to-playlist mappings.",
+    )
     return parser.parse_args()
 
 
 def parse_utc_datetime(date_value: str) -> datetime:
-    # ESPN commonly returns UTC strings ending in Z.
     if date_value.endswith("Z"):
         date_value = date_value.replace("Z", "+00:00")
     parsed = datetime.fromisoformat(date_value)
@@ -89,8 +91,13 @@ def parse_utc_datetime(date_value: str) -> datetime:
     return parsed.astimezone()
 
 
-def fetch_json(url: str) -> dict:
-    with urllib.request.urlopen(url, timeout=20) as response:
+def normalize(value: str) -> str:
+    return "".join(ch for ch in value.lower() if ch.isalnum() or ch.isspace()).strip()
+
+
+def fetch_json(url: str, headers: Optional[Dict[str, str]] = None) -> dict:
+    request = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(request, timeout=20) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -114,16 +121,13 @@ def build_fpp_auth_header(
                 "(or FPP_USERNAME/FPP_PASSWORD)"
             )
         raw = f"{username}:{password}".encode("utf-8")
-        encoded = base64.b64encode(raw).decode("ascii")
-        return ("Authorization", f"Basic {encoded}")
+        return ("Authorization", f"Basic {base64.b64encode(raw).decode('ascii')}")
 
-    # auto
     if token:
         return ("Authorization", f"Bearer {token}")
     if username and password:
         raw = f"{username}:{password}".encode("utf-8")
-        encoded = base64.b64encode(raw).decode("ascii")
-        return ("Authorization", f"Basic {encoded}")
+        return ("Authorization", f"Basic {base64.b64encode(raw).decode('ascii')}")
     return None
 
 
@@ -131,13 +135,31 @@ def fetch_fpp_json(fpp_api_url: str, auth_header: Optional[Tuple[str, str]]) -> 
     headers = {"Accept": "application/json"}
     if auth_header:
         headers[auth_header[0]] = auth_header[1]
-    req = urllib.request.Request(fpp_api_url, headers=headers)
-    with urllib.request.urlopen(req, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return fetch_json(fpp_api_url, headers=headers)
 
 
-def normalize(value: str) -> str:
-    return "".join(ch for ch in value.lower() if ch.isalnum() or ch.isspace()).strip()
+def load_mappings(mappings_file: str) -> List[dict]:
+    if not mappings_file:
+        return default_mappings()
+    if not os.path.exists(mappings_file):
+        print(
+            f"[WARN] Mappings file '{mappings_file}' not found. Falling back to defaults."
+        )
+        return default_mappings()
+
+    with open(mappings_file, "r", encoding="utf-8") as file:
+        loaded = json.load(file)
+
+    if isinstance(loaded, dict):
+        mappings = loaded.get("mappings", [])
+    elif isinstance(loaded, list):
+        mappings = loaded
+    else:
+        raise ValueError("Mappings file must contain a list or object with 'mappings'.")
+
+    if not isinstance(mappings, list):
+        raise ValueError("Mappings must be a list.")
+    return mappings
 
 
 def league_teams_url(sport: str, league: str) -> str:
@@ -148,52 +170,63 @@ def team_schedule_base_url(sport: str, league: str, team_id: str) -> str:
     return f"{ESPN_SITE_API_BASE}/apis/site/v2/sports/{sport}/{league}/teams/{team_id}/schedule"
 
 
-def resolve_team_id(team_info: Dict[str, object]) -> Optional[str]:
-    sport = str(team_info["sport"])
-    league = str(team_info["league"])
-    team_query = normalize(str(team_info.get("team_query", "")))
-    abbreviation = normalize(str(team_info.get("abbreviation", "")))
+def build_request_url(base_url: str, dates_value: str) -> str:
+    parts = urllib.parse.urlsplit(base_url)
+    query = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+    query["dates"] = dates_value
+    return urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(query), parts.fragment)
+    )
 
+
+def resolve_team_id(mapping: dict) -> Optional[str]:
+    explicit_id = str(mapping.get("team_id", "")).strip()
+    if explicit_id:
+        return explicit_id
+
+    sport = str(mapping.get("sport", "")).strip()
+    league = str(mapping.get("league", "")).strip()
+    if not sport or not league:
+        return None
+
+    team_name = normalize(str(mapping.get("team_name", "")))
+    team_abbr = normalize(str(mapping.get("team_abbr", "")))
     data = fetch_json(league_teams_url(sport, league))
+
     sports = data.get("sports", [])
     if not sports:
         return None
-
     leagues = sports[0].get("leagues", [])
     if not leagues:
         return None
 
     best_match_id = None
     best_score = -1
-
     for wrapped in leagues[0].get("teams", []):
         team = wrapped.get("team", {})
         if not isinstance(team, dict):
             continue
-
-        display_name = normalize(str(team.get("displayName", "")))
-        short_name = normalize(str(team.get("shortDisplayName", "")))
-        name = normalize(str(team.get("name", "")))
-        abbr = normalize(str(team.get("abbreviation", "")))
-        slug = normalize(str(team.get("slug", "")))
         team_id = str(team.get("id", "")).strip()
         if not team_id:
             continue
 
+        display_name = normalize(str(team.get("displayName", "")))
+        short_name = normalize(str(team.get("shortDisplayName", "")))
+        abbr = normalize(str(team.get("abbreviation", "")))
+        slug = normalize(str(team.get("slug", "")))
+
         score = 0
-        if abbreviation and abbreviation == abbr:
+        if team_abbr and team_abbr == abbr:
             score += 100
-        if team_query and team_query == display_name:
+        if team_name and team_name == display_name:
             score += 80
-        if team_query and team_query == short_name:
+        if team_name and team_name == short_name:
             score += 70
-        if team_query and team_query == name:
-            score += 60
-        if team_query and team_query in display_name:
+        if team_name and team_name in display_name:
             score += 40
-        if team_query and team_query in short_name:
+        if team_name and team_name in short_name:
             score += 30
-        if team_query and team_query in slug:
+        if team_name and team_name in slug:
             score += 20
 
         if score > best_score:
@@ -203,17 +236,7 @@ def resolve_team_id(team_info: Dict[str, object]) -> Optional[str]:
     return best_match_id if best_score > 0 else None
 
 
-def build_request_url(base_url: str, day_yyyymmdd: str) -> str:
-    parts = urllib.parse.urlsplit(base_url)
-    query = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
-    query["dates"] = day_yyyymmdd
-    new_query = urllib.parse.urlencode(query)
-    return urllib.parse.urlunsplit(
-        (parts.scheme, parts.netloc, parts.path, new_query, parts.fragment)
-    )
-
-
-def collect_games(days: int) -> List[dict]:
+def collect_games(days: int, mappings: List[dict]) -> List[dict]:
     if days < 1:
         raise ValueError("--days must be at least 1")
 
@@ -227,43 +250,48 @@ def collect_games(days: int) -> List[dict]:
     scheduled_slots: List[dict] = []
     seen_event_keys = set()
 
-    resolved_team_ids: Dict[str, str] = {}
+    for mapping in mappings:
+        playlist = str(mapping.get("playlist", "")).strip()
+        sport = str(mapping.get("sport", "")).strip()
+        league = str(mapping.get("league", "")).strip()
+        team_name = str(mapping.get("team_name", "")).strip()
+        team_abbr = str(mapping.get("team_abbr", "")).strip()
 
-    for playlist_name, info in TEAMS.items():
-        team_name = str(info["name"])
-        sport = str(info["sport"])
-        league = str(info["league"])
-        game_length_hours = float(info.get("game_length_hours", 3.0))
+        if not playlist or not sport or not league:
+            print("[WARN] Skipping mapping missing playlist/sport/league.")
+            continue
 
-        team_id = resolved_team_ids.get(playlist_name)
+        pregame_minutes = int(mapping.get("pregame_minutes", 60))
+        game_length_hours = float(mapping.get("game_length_hours", 3.0))
+        postgame_buffer_minutes = int(mapping.get("postgame_buffer_minutes", 30))
+
+        try:
+            team_id = resolve_team_id(mapping)
+        except Exception as exc:
+            print(f"[WARN] Could not resolve team ID for '{team_name or team_abbr}': {exc}")
+            continue
+
         if not team_id:
-            try:
-                team_id = resolve_team_id(info)
-            except Exception as exc:
-                print(f"[WARN] Could not resolve ESPN team ID for {team_name}: {exc}")
-                continue
-            if not team_id:
-                print(f"[WARN] Could not resolve ESPN team ID for {team_name}")
-                continue
-            resolved_team_ids[playlist_name] = team_id
-            print(f"[INFO] Resolved {team_name} to ESPN team ID {team_id}")
+            print(f"[WARN] Could not resolve team ID for '{team_name or team_abbr}'.")
+            continue
 
-        base_url = team_schedule_base_url(sport, league, team_id)
-        request_url = build_request_url(base_url, dates_value)
+        label_name = team_name or team_abbr or f"{sport}/{league} #{team_id}"
+        print(f"[INFO] Mapping '{label_name}' -> ESPN team ID {team_id}, playlist '{playlist}'")
 
+        request_url = build_request_url(team_schedule_base_url(sport, league, team_id), dates_value)
         try:
             data = fetch_json(request_url)
         except urllib.error.URLError as exc:
-            print(f"[WARN] Could not fetch {team_name} schedule ({request_url}): {exc}")
+            print(f"[WARN] Could not fetch schedule for '{label_name}' ({request_url}): {exc}")
             continue
         except json.JSONDecodeError as exc:
-            print(f"[WARN] Invalid JSON for {team_name} ({request_url}): {exc}")
+            print(f"[WARN] Invalid JSON for '{label_name}' ({request_url}): {exc}")
             continue
 
         for event in data.get("events", []):
             event_name = event.get("name", "")
             event_date_raw = event.get("date")
-            event_id = str(event.get("id", ""))
+            event_id = str(event.get("id", "")).strip()
             if not event_date_raw:
                 continue
 
@@ -273,31 +301,34 @@ def collect_games(days: int) -> List[dict]:
                 print(f"[WARN] Unparseable date '{event_date_raw}' in event '{event_name}'")
                 continue
 
-            # Some ESPN team schedule endpoints still return full season;
-            # keep only events in the requested local date window.
             kickoff_day = local_kickoff.date()
             if kickoff_day < start_day or kickoff_day > end_day:
                 continue
 
-            unique_key = (playlist_name, event_id or event_name, local_kickoff.isoformat())
+            unique_key = (playlist, team_id, event_id or event_name, local_kickoff.isoformat())
             if unique_key in seen_event_keys:
                 continue
             seen_event_keys.add(unique_key)
 
-            start_show = local_kickoff - timedelta(hours=1)
-            end_show = local_kickoff + timedelta(hours=game_length_hours, minutes=30)
-
-            slot = {
-                "playlist": playlist_name,
-                "startDate": start_show.strftime("%Y-%m-%d"),
-                "endDate": end_show.strftime("%Y-%m-%d"),
-                "startTime": int(start_show.strftime("%H%M%S")),
-                "endTime": int(end_show.strftime("%H%M%S")),
-                "label": event_name,
-            }
-            scheduled_slots.append(slot)
+            start_show = local_kickoff - timedelta(minutes=pregame_minutes)
+            end_show = local_kickoff + timedelta(
+                hours=game_length_hours, minutes=postgame_buffer_minutes
+            )
+            scheduled_slots.append(
+                {
+                    "playlist": playlist,
+                    "startDate": start_show.strftime("%Y-%m-%d"),
+                    "endDate": end_show.strftime("%Y-%m-%d"),
+                    "startTime": int(start_show.strftime("%H%M%S")),
+                    "endTime": int(end_show.strftime("%H%M%S")),
+                    "label": event_name,
+                    "team_id": team_id,
+                    "sport": sport,
+                    "league": league,
+                }
+            )
             print(
-                f"[INFO] {team_name}: {event_name} -> "
+                f"[INFO] {label_name}: {event_name} -> "
                 f"{start_show.strftime('%Y-%m-%d %H:%M')} to {end_show.strftime('%Y-%m-%d %H:%M')}"
             )
 
@@ -322,9 +353,6 @@ def fetch_current_schedule_payload(
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"FPP returned invalid JSON for schedule: {exc}") from exc
 
-    # FPP may return either:
-    # 1) a raw array of schedule entries, or
-    # 2) an object wrapper containing "entries".
     if isinstance(payload, list):
         payload = {"entries": payload}
     elif not isinstance(payload, dict):
@@ -335,33 +363,31 @@ def fetch_current_schedule_payload(
         payload["entries"] = []
     elif not isinstance(entries, list):
         raise RuntimeError("Unexpected FPP payload format: 'entries' is not a list")
-
     return payload
 
 
 def merge_entries(payload: dict, new_games: List[dict]) -> dict:
     entries = payload.get("entries", [])
-    managed_playlists = set(TEAMS.keys())
-
-    cleaned_entries = [
-        entry for entry in entries if entry.get("playlist") not in managed_playlists
-    ]
+    cleaned_entries = [entry for entry in entries if entry.get(PLUGIN_MARKER_KEY) != 1]
 
     new_entries = []
     for game in new_games:
-        new_entry = {
-            "enabled": 1,
-            "playlist": game["playlist"],
-            "type": "playlist",
-            "startDay": 0,
-            "endDay": 6,
-            "startTime": game["startTime"],
-            "endTime": game["endTime"],
-            "startDate": game["startDate"],
-            "endDate": game["endDate"],
-            "repeat": 1,
-        }
-        new_entries.append(new_entry)
+        new_entries.append(
+            {
+                "enabled": 1,
+                "playlist": game["playlist"],
+                "type": "playlist",
+                "startDay": 0,
+                "endDay": 6,
+                "startTime": game["startTime"],
+                "endTime": game["endTime"],
+                "startDate": game["startDate"],
+                "endDate": game["endDate"],
+                "repeat": 1,
+                PLUGIN_MARKER_KEY: 1,
+                "note": game.get("label", ""),
+            }
+        )
 
     payload["entries"] = new_entries + cleaned_entries
     return payload
@@ -370,34 +396,36 @@ def merge_entries(payload: dict, new_games: List[dict]) -> dict:
 def post_schedule(
     fpp_api_url: str, payload: dict, auth_header: Optional[Tuple[str, str]]
 ) -> None:
-    # Send back a raw schedule array for compatibility with configfile semantics.
     post_body = payload.get("entries", [])
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if auth_header:
         headers[auth_header[0]] = auth_header[1]
-    req = urllib.request.Request(
+    request = urllib.request.Request(
         fpp_api_url,
         data=json.dumps(post_body).encode("utf-8"),
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=20) as response:
+    with urllib.request.urlopen(request, timeout=20) as response:
         if response.status != 200:
             raise RuntimeError(f"FPP returned HTTP {response.status} on update")
 
 
 def sync_fpp_schedule(
-    days: int, fpp_api_url: str, dry_run: bool, auth_header: Optional[Tuple[str, str]]
+    days: int,
+    fpp_api_url: str,
+    dry_run: bool,
+    auth_header: Optional[Tuple[str, str]],
+    mappings: List[dict],
 ) -> int:
-    new_games = collect_games(days=days)
+    new_games = collect_games(days=days, mappings=mappings)
     payload = fetch_current_schedule_payload(fpp_api_url, auth_header)
     existing_count = len(payload.get("entries", []))
     merged_payload = merge_entries(payload, new_games)
-    merged_count = len(merged_payload.get("entries", []))
 
     print(f"[INFO] Existing entries: {existing_count}")
     print(f"[INFO] New game windows: {len(new_games)}")
-    print(f"[INFO] Resulting entries: {merged_count}")
+    print(f"[INFO] Resulting entries: {len(merged_payload.get('entries', []))}")
 
     if dry_run:
         print("[DRY-RUN] No changes posted to FPP.")
@@ -418,11 +446,13 @@ def main() -> int:
             password=args.fpp_password,
             token=args.fpp_token,
         )
+        mappings = load_mappings(args.mappings_file)
         sync_fpp_schedule(
             days=args.days,
             fpp_api_url=args.fpp_url,
             dry_run=args.dry_run,
             auth_header=auth_header,
+            mappings=mappings,
         )
     except Exception as exc:
         print(f"[ERROR] {exc}")

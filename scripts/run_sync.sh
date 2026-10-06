@@ -32,7 +32,7 @@ if [[ -f "${SETTINGS_FILE}" ]]; then
   fi
 fi
 
-ARGS=( "--fpp-url" "${FPP_URL}" "--days" "${DAYS}" "--fpp-auth" "${AUTH_MODE}" )
+ARGS=( "--fpp-url" "${FPP_URL}" "--days" "${DAYS}" "--fpp-auth" "${AUTH_MODE}" "--mappings-file" "${SETTINGS_FILE}" )
 if [[ "${DRY_RUN}" == "1" ]]; then
   ARGS+=( "--dry-run" )
 fi
