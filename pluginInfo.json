@@ -1,0 +1,32 @@
+{
+  "repoName": "fpp-game-scheduler",
+  "name": "FPP Game Scheduler",
+  "author": "Dale Peterson",
+  "license": "MIT",
+  "description": "Sync ESPN team schedules to FPP playlists with optional dry-run and date lookahead.",
+  "homeURL": "https://github.com/MuzickMan80/fpp-game-scheduler",
+  "srcURL": "https://github.com/MuzickMan80/fpp-game-scheduler",
+  "bugURL": "https://github.com/MuzickMan80/fpp-game-scheduler/issues",
+  "category": "automation",
+  "versions": [
+    {
+      "minFPPVersion": "0",
+      "maxFPPVersion": "0",
+      "branch": "main",
+      "sha": ""
+    }
+  ],
+  "privacy": {
+    "summary": "Fetches game schedules from ESPN APIs and updates this FPP instance schedule.",
+    "sends": [],
+    "collects": [],
+    "sensors": [],
+    "remoteAccess": "none",
+    "systemChanges": [
+      "Writes plugin settings JSON under /home/fpp/media/config.",
+      "Writes schedule entries through the local FPP API endpoint."
+    ],
+    "closedCode": false,
+    "other": "Outbound network access to ESPN API hosts is required."
+  }
+}
